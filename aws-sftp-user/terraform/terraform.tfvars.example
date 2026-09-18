@@ -1,0 +1,14 @@
+aws_region                  = "us-east-1"
+server_id                   = "s-0123456789abcdef0"
+user_name                   = "vendor-acme"
+role_arn                    = "arn:aws:iam::123456789012:role/transfer-family-sftp-role"
+s3_bucket                   = "my-transfer-bucket"
+home_directory_type         = "LOGICAL"
+home_directory_entry_target = "/my-transfer-bucket/vendor-acme"
+public_key_path             = "../keys/vendor-acme_id_ed25519.pub"
+
+tags = {
+  Environment = "prod"
+  ManagedBy   = "terraform"
+  Project     = "sftp-to-rackspace-migration"
+}

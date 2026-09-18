@@ -1,0 +1,89 @@
+name: SFTP User - Terraform Apply & Connection Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      user_name:
+        description: "SFTP user name to provision"
+        required: true
+
+permissions:
+  id-token: write   # required for OIDC -> AWS role assumption
+  contents: read
+
+jobs:
+  terraform:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: terraform
+    outputs:
+      sftp_endpoint: ${{ steps.tf_outputs.outputs.sftp_endpoint }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.0"
+
+      - name: Terraform init
+        run: terraform init
+
+      - name: Terraform plan
+        run: |
+          terraform plan \
+            -var="aws_region=${{ vars.AWS_REGION }}" \
+            -var="server_id=${{ vars.TRANSFER_SERVER_ID }}" \
+            -var="user_name=${{ inputs.user_name }}" \
+            -var="role_arn=${{ vars.TRANSFER_ROLE_ARN }}" \
+            -var="s3_bucket=${{ vars.TRANSFER_S3_BUCKET }}" \
+            -var="public_key_path=../keys/${{ inputs.user_name }}_id_ed25519.pub" \
+            -out=tfplan
+
+      - name: Terraform apply
+        run: terraform apply -auto-approve tfplan
+
+      - name: Capture outputs
+        id: tf_outputs
+        run: echo "sftp_endpoint=$(terraform output -raw sftp_endpoint)" >> "$GITHUB_OUTPUT"
+
+  test-connection:
+    needs: terraform
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch private key from Vault
+        id: vault
+        uses: hashicorp/vault-action@v3
+        with:
+          url: ${{ secrets.VAULT_ADDR }}
+          method: jwt
+          role: github-actions-sftp
+          secrets: |
+            secret/data/sftp/${{ inputs.user_name }} private_key | SFTP_PRIVATE_KEY
+
+      - name: Write private key to disk
+        run: |
+          umask 077
+          printf '%s\n' "$SFTP_PRIVATE_KEY" > /tmp/sftp_key
+        env:
+          SFTP_PRIVATE_KEY: ${{ steps.vault.outputs.SFTP_PRIVATE_KEY }}
+
+      - name: Run connection test
+        run: |
+          chmod +x scripts/test_sftp_connection.sh
+          ./scripts/test_sftp_connection.sh \
+            "${{ inputs.user_name }}" \
+            "${{ needs.terraform.outputs.sftp_endpoint }}" \
+            /tmp/sftp_key
+
+      - name: Clean up key
+        if: always()
+        run: shred -u /tmp/sftp_key || rm -f /tmp/sftp_key

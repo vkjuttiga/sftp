@@ -2,7 +2,28 @@
 # (GetBucketLocation + DeleteObject) already exist and are passed in as variables.
 # This module only creates the SFTP user and attaches its public SSH key.
 
+locals {
+  scope_down_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid      = "AllowGetBucketLocation"
+        Effect   = "Allow"
+        Action   = "s3:GetBucketLocation"
+        Resource = "arn:aws:s3:::${var.s3_bucket}"
+      },
+      {
+        Sid      = "AllowDeleteObjectInHomeFolder"
+        Effect   = "Allow"
+        Action   = "s3:DeleteObject"
+        Resource = "arn:aws:s3:::${var.s3_bucket}/${var.user_name}/*"
+      }
+    ]
+  })
+}
+
 resource "aws_transfer_user" "this" {
+  policy              = local.scope_down_policy
   server_id           = var.server_id
   user_name           = var.user_name
   role                = var.role_arn

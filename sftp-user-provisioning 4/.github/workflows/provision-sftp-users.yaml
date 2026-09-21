@@ -1,0 +1,104 @@
+name: Provision SFTP users
+
+# users.yaml is the source of truth.
+#   pull request touching users.yaml -> validate only (no cloud access)
+#   push to main touching users.yaml -> validate, plan, WAIT FOR APPROVAL, apply
+#   manual run                       -> same as a push (re-run after a failure)
+on:
+  pull_request:
+    paths: [users.yaml]
+  push:
+    branches: [main]
+    paths: [users.yaml]
+  workflow_dispatch:
+
+permissions:
+  id-token: write # GitHub OIDC -> AWS and Vault, no stored credentials
+  contents: read
+
+# Never run two provisioning jobs at the same time
+concurrency:
+  group: sftp-user-provisioning
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  TRANSFER_SERVER_ID: ${{ vars.TRANSFER_SERVER_ID }}
+  S3_BUCKET: ${{ vars.S3_BUCKET }}
+  TRANSFER_ROLE_ARN: ${{ vars.TRANSFER_ROLE_ARN }}
+  TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+  VAULT_ADDR: ${{ vars.VAULT_ADDR }}
+  VAULT_ROLE: ${{ vars.VAULT_ROLE }}
+  VAULT_NAMESPACE: ${{ vars.VAULT_NAMESPACE }}
+  VAULT_KV_MOUNT: ${{ vars.VAULT_KV_MOUNT || 'secret' }}
+  VAULT_KV_PREFIX: ${{ vars.VAULT_KV_PREFIX || 'sftp' }}
+  SFTP_HOST: ${{ vars.SFTP_HOST }}
+
+jobs:
+  # ------------------------------------------------------------------
+  # 1. Is users.yaml well formed? Needs no credentials, so it also runs
+  #    on pull requests, including from forks.
+  # ------------------------------------------------------------------
+  validate:
+    name: Validate users.yaml
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash scripts/provision-all.sh validate
+
+  # ------------------------------------------------------------------
+  # 2. Show what would happen. Nothing is created, no approval needed.
+  # ------------------------------------------------------------------
+  plan:
+    name: Plan
+    needs: validate
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_PIPELINE_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.10.5
+          terraform_wrapper: false
+
+      - run: bash scripts/provision-all.sh plan
+
+  # ------------------------------------------------------------------
+  # 3. Waits for a human. The "sftp-production" environment has required
+  #    reviewers, so this job does not start until someone approves the
+  #    run after reading the plan in the plan job's summary.
+  # ------------------------------------------------------------------
+  apply:
+    name: Apply (needs approval)
+    needs: plan
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    environment: sftp-production
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_PIPELINE_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.10.5
+          terraform_wrapper: false
+
+      - name: Create users, test login, store keys in Vault
+        env:
+          # Store this as an ENVIRONMENT secret on "sftp-production": it then only
+          # exists in this approved job. If it is not set, the script falls back to
+          # GitHub OIDC login (VAULT_ROLE) instead.
+          VAULT_TOKEN: ${{ secrets.VAULT_TOKEN }}
+        run: bash scripts/provision-all.sh apply

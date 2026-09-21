@@ -1,0 +1,19 @@
+# SFTP users to provision.
+#
+# One entry per user:
+#   name - the SFTP user name (3-100 chars: letters, digits, _ @ . -)
+#   path - folder INSIDE the bucket the user is locked into (no leading slash needed)
+#
+# Add one user or many. Commit to main -> the pipeline plans, waits for approval, creates.
+# Users that already exist with the same path are skipped, so old entries can stay.
+# Removing an entry does NOT delete the user.
+#
+# Example (uncomment, edit, commit):
+#
+# users:
+#   - name: acme
+#     path: acme/inbound
+#   - name: globex
+#     path: globex/drop
+
+users: []

@@ -1,0 +1,27 @@
+name: Test Keeper Connection
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test-connection:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Keeper Commander
+        run: pip install keepercommander
+
+      - name: Restore persistent-login config
+        run: |
+          mkdir -p ~/.keeper
+          echo "${{ secrets.KEEPER_CONFIG_JSON }}" > ~/.keeper/config.json
+
+      - name: Whoami (confirms auth works)
+        run: keeper --config=$HOME/.keeper/config.json "whoami"
+
+      - name: List shared folders (confirms folder access works)
+        run: keeper --config=$HOME/.keeper/config.json "ls -f"

@@ -3,6 +3,9 @@ name: Test Keeper Connection
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   test-connection:
     runs-on: ubuntu-latest
@@ -16,12 +19,15 @@ jobs:
         run: pip install keepercommander
 
       - name: Restore persistent-login config
+        env:
+          KEEPER_CONFIG_JSON: ${{ secrets.KEEPER_CONFIG_JSON }}
         run: |
           mkdir -p ~/.keeper
-          echo "${{ secrets.KEEPER_CONFIG_JSON }}" > ~/.keeper/config.json
+          umask 077
+          printf '%s' "$KEEPER_CONFIG_JSON" > ~/.keeper/config.json
 
       - name: Whoami (confirms auth works)
-        run: keeper --config=$HOME/.keeper/config.json "whoami"
+        run: keeper --config="$HOME/.keeper/config.json" "whoami"
 
       - name: List shared folders (confirms folder access works)
-        run: keeper --config=$HOME/.keeper/config.json "ls -f"
+        run: keeper --config="$HOME/.keeper/config.json" "ls -f"

@@ -45,19 +45,3 @@ variable "users" {
     error_message = "home_directory_target must not contain '..'."
   }
 }
-
-# The role's own policy and this per-user policy are intersected by AWS, so a
-# user can only do what BOTH allow. Defaults match what was asked for; add
-# s3:ListBucket / s3:GetObject / s3:PutObject here if users must list, download
-# or upload (and make sure the shared role allows them too).
-variable "bucket_actions" {
-  description = "Actions allowed on the bucket itself."
-  type        = list(string)
-  default     = ["s3:GetBucketLocation"]
-}
-
-variable "object_actions" {
-  description = "Actions allowed on objects under the user's own folder."
-  type        = list(string)
-  default     = ["s3:DeleteObject"]
-}

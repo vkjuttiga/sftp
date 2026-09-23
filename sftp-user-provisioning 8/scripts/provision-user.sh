@@ -6,15 +6,22 @@
 #   provision-user.sh apply <user> <path>   creates the user for real
 #
 # apply order (nothing irreversible happens before the checks pass):
-#   1. check the user: already there with the same path -> skip (exit 10);
-#      already there with a different path -> error; and no record in
-#      Keeper yet for this user
-#   2. generate an RSA SSH keypair in RAM (/dev/shm)
-#   3. terraform apply  (user + public key + scope-down policy)
+#   1. check the user: not there -> create it below. Already there with the
+#      same path AND a Keeper record -> skip (exit 10). Already there with
+#      the same path but NO Keeper record (a previous run got the user
+#      created and then failed before/during the Keeper upload) -> resume:
+#      redo steps 2-5 for that same user, replacing its unusable orphaned
+#      key. Already there with a different path -> error.
+#   2. generate an RSA SSH keypair under $TMPDIR (shredded on exit)
+#   3. terraform apply  (user + public key)
 #   4. test the SFTP login with the private key
 #   5. only then: store the private key in Keeper via Commander CLI
-# If anything fails after step 3 the user is destroyed again, so a re-run
-# starts clean. Existing users are never modified.
+# If anything fails after step 3 the user (or, when resuming, just its new
+# SSH key) is destroyed again, so a re-run starts clean either way. Existing
+# users are never modified beyond attaching/replacing their SSH key.
+#
+# plan mode never generates a real keypair - it writes a placeholder public
+# key, since that's all terraform plan needs to read.
 #
 # Required env : AWS_REGION TRANSFER_SERVER_ID S3_BUCKET TRANSFER_ROLE_ARN TF_STATE_BUCKET
 # apply also   : KEEPER_CONFIG - path to a Commander config.json with a
@@ -74,6 +81,9 @@ VARS="$WORK/users.tfvars.json"
 
 TF_CREATED=0        # 1 while a user exists that has not been fully delivered
 KEEPER_WRITTEN=0
+RESUME=0            # 1 = user already existed without a Keeper record; only
+                     # finish that leftover work, don't treat this as a
+                     # brand-new user for rollback purposes
 
 tf() { terraform -chdir="$TF_DIR" "$@"; }
 
@@ -83,9 +93,16 @@ cleanup() {
 
   if [[ $rc -ne 0 ]]; then
     if [[ $TF_CREATED -eq 1 ]]; then
-      log "failed after creating the user - rolling back"
-      tf destroy -auto-approve -input=false -var-file="$VARS" \
-        || log "ROLLBACK FAILED: delete user '$USER_NAME' and state key sftp-users/$USER_NAME.tfstate by hand"
+      if [[ $RESUME -eq 1 ]]; then
+        log "failed while resuming an existing user - rolling back just the new SSH key (the user itself pre-dates this run, so it's left alone)"
+        tf destroy -auto-approve -input=false -var-file="$VARS" \
+          -target="aws_transfer_ssh_key.this[\"$USER_NAME\"]" \
+          || log "ROLLBACK FAILED: remove the SSH key you just tried to attach for user '$USER_NAME' by hand"
+      else
+        log "failed after creating the user - rolling back"
+        tf destroy -auto-approve -input=false -var-file="$VARS" \
+          || log "ROLLBACK FAILED: delete user '$USER_NAME' and state key sftp-users/$USER_NAME.tfstate by hand"
+      fi
     fi
     if [[ $KEEPER_WRITTEN -eq 1 ]]; then
       log "removing the Keeper record written for this failed run"
@@ -132,16 +149,19 @@ keeper_record_exists() {
 
 keeper_store_key() {
   log "writing the private key to Keeper as '$RECORD_TITLE'"
-  local priv pub cmd folder_arg=""
-  priv="$(cat "$KEY")"
-  pub="$(cat "$KEY.pub")"
+  # The key is stored base64-encoded on a single line. Embedding the raw PEM
+  # (with its literal newlines) inside one Commander command string was
+  # crashing the CLI on some setups - base64 sidesteps that entirely.
+  local priv_b64 pub_b64 cmd folder_arg=""
+  priv_b64="$(base64 <"$KEY" | tr -d '\n')"
+  pub_b64="$(base64 <"$KEY.pub" | tr -d '\n')"
   [[ -n "$KEEPER_FOLDER" ]] && folder_arg=" --folder \"$KEEPER_FOLDER\""
 
   cmd="record-add --title \"$RECORD_TITLE\" --record-type login --force$folder_arg"
   cmd="$cmd \"login=$USER_NAME\""
   cmd="$cmd \"c.text.path=$USER_PATH\""
-  cmd="$cmd \"c.text.public_key=$pub\""
-  cmd="$cmd \"c.secret.private_key=$priv\""
+  cmd="$cmd \"c.text.public_key_b64=$pub_b64\""
+  cmd="$cmd \"c.secret.private_key_b64=$priv_b64\""
 
   "$KEEPER_CLI" --config="$KEEPER_CONFIG" "$cmd" >/dev/null
   KEEPER_WRITTEN=1
@@ -158,11 +178,22 @@ check_existing_user() {
     current="$(jq -r '.User.HomeDirectoryMappings[0].Target // .User.HomeDirectory // ""' <<<"$out")"
     current="${current%/}"
     expected="/${S3_BUCKET}/${USER_PATH}"
-    if [[ "$current" == "$expected" ]]; then
-      log "already exists with the same path - skipping"
-      exit 10 # provision-all.sh treats this as "already exists, nothing to do"
+    if [[ "$current" != "$expected" ]]; then
+      die "already exists but points to '$current' while users.yaml says '$expected'. The pipeline never changes existing users: fix users.yaml or change the user by hand"
     fi
-    die "already exists but points to '$current' while users.yaml says '$expected'. The pipeline never changes existing users: fix users.yaml or change the user by hand"
+
+    # User exists at the right path. That alone doesn't mean it's finished -
+    # a previous run can have created the user and then failed before (or
+    # during) the Keeper upload. Only treat it as done if Keeper already has
+    # the key; otherwise resume just the leftover work.
+    if [[ "$MODE" == "apply" ]] && ! keeper_record_exists; then
+      log "user exists but Keeper has no record for it - resuming: will generate a new key, attach it, test, and store it (the old, never-stored key is unusable and will be replaced)"
+      RESUME=1
+      return
+    fi
+
+    log "already exists with the same path and a Keeper record - skipping"
+    exit 10 # provision-all.sh treats this as "already exists, nothing to do"
   elif [[ "$out" != *ResourceNotFoundException* ]]; then
     die "could not check whether the user exists: $out"
   fi
@@ -210,16 +241,21 @@ test_connection() {
 # ---------------------------------------------------------------- main ------
 check_existing_user
 
-if [[ "$MODE" == "apply" ]] && keeper_record_exists; then
+if [[ "$MODE" == "apply" && $RESUME -eq 0 ]] && keeper_record_exists; then
   die "Keeper already has a record titled '$RECORD_TITLE' - refusing to overwrite"
 fi
 
-generate_keys
+if [[ "$MODE" == "plan" ]]; then
+  log "writing a placeholder public key (plan only needs terraform to read *a* public key file - no real keypair is generated until apply)"
+  printf 'ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQC0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000 plan-placeholder-not-a-real-key\n' >"$KEY.pub"
+else
+  generate_keys
+fi
 write_tfvars
 tf_init
 
 if [[ "$MODE" == "plan" ]]; then
-  log "running terraform plan (this key is throw-away, just so terraform has a public key to read)"
+  log "running terraform plan"
   tf plan -input=false -no-color -var-file="$VARS"
   exit 0
 fi
@@ -233,4 +269,8 @@ test_connection || die "could not log in with the new key"
 keeper_store_key
 TF_CREATED=0
 KEEPER_WRITTEN=0
-log "done: user created, login tested, private key stored in Keeper as '$RECORD_TITLE'"
+if [[ $RESUME -eq 1 ]]; then
+  log "done: existing user's key regenerated, login tested, private key stored in Keeper as '$RECORD_TITLE'"
+else
+  log "done: user created, login tested, private key stored in Keeper as '$RECORD_TITLE'"
+fi

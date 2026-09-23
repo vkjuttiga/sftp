@@ -7,35 +7,17 @@ locals {
   }
 }
 
-# Scope-down policy, one per user. It is attached to the user (not the shared
-# role), so each user is limited to their own folder even though they all
-# assume the same IAM role.
-data "aws_iam_policy_document" "scope_down" {
-  for_each = local.users
-
-  statement {
-    sid       = "BucketLevel"
-    actions   = var.bucket_actions
-    resources = ["arn:aws:s3:::${var.bucket_name}"]
-  }
-
-  statement {
-    sid       = "OwnFolderOnly"
-    actions   = var.object_actions
-    resources = ["arn:aws:s3:::${var.bucket_name}/${each.value.prefix}/*"]
-  }
-}
-
 resource "aws_transfer_user" "this" {
   for_each = local.users
 
   server_id = var.server_id
   user_name = each.key
   role      = var.role_arn
-  policy    = data.aws_iam_policy_document.scope_down[each.key].json
 
   # The user sees "/" but it is really s3://<bucket>/<prefix>. They cannot
-  # navigate above it.
+  # navigate above it. Permissions on what they can DO once there come
+  # entirely from var.role_arn - the same shared role for every user, with
+  # no per-user scope-down policy on top of it.
   home_directory_type = "LOGICAL"
   home_directory_mappings {
     entry  = "/"

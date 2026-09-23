@@ -29,8 +29,11 @@
 # Optional     : KEY_TYPE (rsa|ed25519, default rsa, 4096-bit when rsa)
 #                SFTP_HOST
 #                KEEPER_CLI (default: keeper)
-#                KEEPER_RECORD_PREFIX (default: sftp) - record titled "<prefix>/<user>"
-#                KEEPER_FOLDER (optional Keeper folder to file the record in)
+#                KEEPER_RECORD_PREFIX (default: sftp) - the record's title
+#                inside each user's folder
+#                KEEPER_FOLDER (optional parent Keeper folder; a subfolder
+#                named after each user is created under it - or under the
+#                Keeper root if this is unset - and the key is stored there)
 #                TMPDIR (default: /tmp) - where the keypair is briefly written;
 #                shredded (overwritten, then unlinked) as soon as the run ends
 
@@ -50,7 +53,11 @@ SFTP_HOST="${SFTP_HOST:-${TRANSFER_SERVER_ID}.server.transfer.${AWS_REGION}.amaz
 KEEPER_CLI="${KEEPER_CLI:-keeper}"
 KEEPER_RECORD_PREFIX="${KEEPER_RECORD_PREFIX:-sftp}"
 KEEPER_FOLDER="${KEEPER_FOLDER:-}"
-RECORD_TITLE="${KEEPER_RECORD_PREFIX}/${USER_NAME}"
+RECORD_TITLE="${KEEPER_RECORD_PREFIX}"
+# One subfolder per user, created under KEEPER_FOLDER (or at the Keeper root
+# if KEEPER_FOLDER is unset): KEEPER_FOLDER/<user_name>/
+USER_FOLDER="${KEEPER_FOLDER:+${KEEPER_FOLDER%/}/}${USER_NAME}"
+RECORD_PATH="${USER_FOLDER}/${RECORD_TITLE}"
 
 TF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../terraform" && pwd)"
 export TF_IN_AUTOMATION=1
@@ -106,8 +113,8 @@ cleanup() {
     fi
     if [[ $KEEPER_WRITTEN -eq 1 ]]; then
       log "removing the Keeper record written for this failed run"
-      "$KEEPER_CLI" --config="$KEEPER_CONFIG" "rm -f \"$RECORD_TITLE\"" >/dev/null 2>&1 \
-        || log "could not remove Keeper record '$RECORD_TITLE' - please delete it by hand"
+      "$KEEPER_CLI" --config="$KEEPER_CONFIG" "rm -f \"$RECORD_PATH\"" >/dev/null 2>&1 \
+        || log "could not remove Keeper record '$RECORD_PATH' - please delete it by hand"
     fi
   fi
 
@@ -139,25 +146,31 @@ keeper() {
 }
 
 keeper_record_exists() {
-  log "checking Keeper for an existing record titled '$RECORD_TITLE'"
+  log "checking Keeper for an existing record at '$RECORD_PATH'"
   local out
-  if out="$(keeper "get \"$RECORD_TITLE\" --format=json" 2>&1)" && [[ "$out" == \{* ]]; then
+  if out="$(keeper "get \"$RECORD_PATH\" --format=json" 2>&1)" && [[ "$out" == \{* ]]; then
     return 0
   fi
   return 1
 }
 
+keeper_ensure_user_folder() {
+  log "ensuring Keeper folder '$USER_FOLDER' exists"
+  # Idempotent: if it already exists this just errors quietly and we carry on.
+  "$KEEPER_CLI" --config="$KEEPER_CONFIG" "mkdir \"$USER_FOLDER\"" >/dev/null 2>&1 || true
+}
+
 keeper_store_key() {
-  log "writing the private key to Keeper as '$RECORD_TITLE'"
+  keeper_ensure_user_folder
+  log "writing the private key to Keeper at '$RECORD_PATH'"
   # The key is stored base64-encoded on a single line. Embedding the raw PEM
   # (with its literal newlines) inside one Commander command string was
   # crashing the CLI on some setups - base64 sidesteps that entirely.
-  local priv_b64 pub_b64 cmd folder_arg=""
+  local priv_b64 pub_b64 cmd
   priv_b64="$(base64 <"$KEY" | tr -d '\n')"
   pub_b64="$(base64 <"$KEY.pub" | tr -d '\n')"
-  [[ -n "$KEEPER_FOLDER" ]] && folder_arg=" --folder \"$KEEPER_FOLDER\""
 
-  cmd="record-add --title \"$RECORD_TITLE\" --record-type login --force$folder_arg"
+  cmd="record-add --title \"$RECORD_TITLE\" --record-type login --force --folder \"$USER_FOLDER\""
   cmd="$cmd \"login=$USER_NAME\""
   cmd="$cmd \"c.text.path=$USER_PATH\""
   cmd="$cmd \"c.text.public_key_b64=$pub_b64\""
@@ -242,7 +255,7 @@ test_connection() {
 check_existing_user
 
 if [[ "$MODE" == "apply" && $RESUME -eq 0 ]] && keeper_record_exists; then
-  die "Keeper already has a record titled '$RECORD_TITLE' - refusing to overwrite"
+  die "Keeper already has a record at '$RECORD_PATH' - refusing to overwrite"
 fi
 
 if [[ "$MODE" == "plan" ]]; then
@@ -270,7 +283,7 @@ keeper_store_key
 TF_CREATED=0
 KEEPER_WRITTEN=0
 if [[ $RESUME -eq 1 ]]; then
-  log "done: existing user's key regenerated, login tested, private key stored in Keeper as '$RECORD_TITLE'"
+  log "done: existing user's key regenerated, login tested, private key stored in Keeper at '$RECORD_PATH'"
 else
-  log "done: user created, login tested, private key stored in Keeper as '$RECORD_TITLE'"
+  log "done: user created, login tested, private key stored in Keeper at '$RECORD_PATH'"
 fi

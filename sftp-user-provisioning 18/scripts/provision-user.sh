@@ -1,21 +1,29 @@
 #!/usr/bin/env bash
 #
-# Provisions one SFTP user in AWS Transfer Family and uploads its key to
-# Keeper. No key material is ever written to disk. Called by
+# Provisions (or deletes) one SFTP user in AWS Transfer Family and its key
+# in Keeper. No key material is ever written to disk. Called by
 # provision-all.sh. See README for setup, env vars, and design notes.
 #
 #   provision-user.sh plan|apply <user> <path>
+#   provision-user.sh delete <user> [path]
 
 set -euo pipefail
 
-MODE="${1:?usage: $0 <plan|apply> <user> <path>}"
-USER_NAME="${2:?usage: $0 <plan|apply> <user> <path>}"
-USER_PATH="${3:?usage: $0 <plan|apply> <user> <path>}"
+MODE="${1:?usage: $0 <plan|apply> <user> <path>  |  $0 delete <user> [path]}"
+USER_NAME="${2:?usage: $0 <plan|apply> <user> <path>  |  $0 delete <user> [path]}"
 
-[[ "$MODE" == "plan" || "$MODE" == "apply" ]] || { echo "mode must be plan or apply" >&2; exit 2; }
+[[ "$MODE" == "plan" || "$MODE" == "apply" || "$MODE" == "delete" ]] \
+  || { echo "mode must be plan, apply or delete" >&2; exit 2; }
+
+if [[ "$MODE" == "delete" ]]; then
+  USER_PATH="${3:-}"   # optional - skips the path safety check below when omitted
+else
+  USER_PATH="${3:?usage: $0 <plan|apply> <user> <path>}"
+fi
 
 : "${AWS_REGION:?}" "${TRANSFER_SERVER_ID:?}" "${S3_BUCKET:?}" "${TRANSFER_ROLE_ARN:?}" "${TF_STATE_BUCKET:?}"
-[[ "$MODE" == "apply" ]] && : "${KEEPER_CONFIG:?apply needs Keeper - it is the only place the key ends up}"
+[[ "$MODE" == "apply" || "$MODE" == "delete" ]] \
+  && : "${KEEPER_CONFIG:?$MODE needs Keeper - it is the only place the key ends up}"
 
 KEY_TYPE="${KEY_TYPE:-rsa}"
 SFTP_HOST="${SFTP_HOST:-${TRANSFER_SERVER_ID}.server.transfer.${AWS_REGION}.amazonaws.com}"
@@ -105,6 +113,57 @@ keeper_record_exists() {
   grep -qF "$RECORD_TITLE" <<<"$out"
 }
 
+# `ls -v` doesn't expose a UID on this Commander version (confirmed live -
+# it shows the same as plain `ls`), and `rm` needs one, same as `get` does.
+# So this collects UID-shaped candidates from several discovery methods,
+# read-verifies each one against the record before ever deleting anything,
+# and - if more than one verifies (can happen: some of these methods search
+# the whole vault, not just this folder) - deletes one at a time and
+# rechecks the folder until the record's actually gone, rather than
+# guessing which UID is the right one.
+keeper_delete_record() {
+  log "looking up the record's UID"
+  local candidates uid verified out
+
+  candidates="$(
+    {
+      "$KEEPER_CLI" --config="$KEEPER_CONFIG" "search \"$RECORD_TITLE\"" 2>&1
+      "$KEEPER_CLI" --config="$KEEPER_CONFIG" "list --format=json \"$RECORD_TITLE\"" 2>&1
+      "$KEEPER_CLI" --config="$KEEPER_CONFIG" "get \"$RECORD_TITLE\"" 2>&1
+      "$KEEPER_CLI" --config="$KEEPER_CONFIG" "get \"$RECORD_TITLE\" --format=json" 2>&1
+    } | grep -oE '[A-Za-z0-9_-]{20,}' | sort -u
+  )"
+  if [[ -z "$candidates" ]]; then
+    log "no UID candidates found for '$RECORD_TITLE'"
+    return 1
+  fi
+
+  verified=""
+  while IFS= read -r uid; do
+    [[ -z "$uid" ]] && continue
+    out="$("$KEEPER_CLI" --config="$KEEPER_CONFIG" "get $uid --format=json" 2>&1)"
+    grep -qF "$RECORD_TITLE" <<<"$out" && verified="$verified
+$uid"
+  done <<<"$candidates"
+  verified="$(sort -u <<<"$verified" | grep -v '^$')"
+  if [[ -z "$verified" ]]; then
+    log "no candidate UID verified against the record"
+    return 1
+  fi
+
+  while IFS= read -r uid; do
+    [[ -z "$uid" ]] && continue
+    keeper_record_exists || break   # already gone - an earlier candidate resolved it
+    "$KEEPER_CLI" --config="$KEEPER_CONFIG" "rm -f $uid" >/dev/null 2>&1
+  done <<<"$verified"
+
+  if keeper_record_exists; then
+    log "record still present after trying every verified UID"
+    return 1
+  fi
+  return 0
+}
+
 check_existing_user() {
   log "checking if user '$USER_NAME' already exists"
   local out current expected
@@ -172,7 +231,54 @@ test_connection() {
   return 1
 }
 
+delete_user() {
+  local out current expected found_in_aws=0 found_in_keeper=0
+
+  log "checking whether '$USER_NAME' exists in Transfer Family"
+  if out="$(aws transfer describe-user --region "$AWS_REGION" --output json \
+    --server-id "$TRANSFER_SERVER_ID" --user-name "$USER_NAME" 2>&1)"; then
+    if [[ -n "$USER_PATH" ]]; then
+      current="$(jq -r '.User.HomeDirectoryMappings[0].Target // .User.HomeDirectory // ""' <<<"$out")"
+      current="${current%/}"
+      expected="/${S3_BUCKET}/${USER_PATH}"
+      [[ "$current" == "$expected" ]] \
+        || die "exists but points to '$current', delete.yaml says '$expected' - refusing to delete the wrong user"
+    fi
+
+    found_in_aws=1
+    log "destroying AWS resources for '$USER_NAME'"
+    printf 'ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQC0 delete-placeholder\n' >"$KEY.pub"
+    write_tfvars
+    tf_init
+    tf destroy -auto-approve -input=false -var-file="$VARS" \
+      || die "terraform destroy failed for '$USER_NAME'"
+  elif [[ "$out" == *ResourceNotFoundException* ]]; then
+    log "not in Transfer Family - nothing to destroy there"
+  else
+    die "could not check for the user: $out"
+  fi
+
+  if keeper_record_exists; then
+    found_in_keeper=1
+    log "deleting Keeper record for '$USER_NAME'"
+    keeper_delete_record || die "could not delete the Keeper record for '$USER_NAME'"
+  else
+    log "no Keeper record found for '$USER_NAME'"
+  fi
+
+  if [[ $found_in_aws -eq 0 && $found_in_keeper -eq 0 ]]; then
+    log "nothing found in AWS or Keeper - already clean"
+    exit 10
+  fi
+  log "done: '$USER_NAME' removed"
+}
+
 # ---------------------------------------------------------------- main ------
+if [[ "$MODE" == "delete" ]]; then
+  delete_user
+  exit 0
+fi
+
 check_existing_user
 
 if [[ "$MODE" == "plan" ]]; then

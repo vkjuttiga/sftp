@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 #
-# No copy-pasting needed. Collects every UID-shaped candidate from several
-# discovery methods, then - safely, read-only, nothing destructive yet -
-# runs `get <candidate>` on each one and checks whether the result actually
-# matches our test record. Only a candidate that verifies this way is ever
-# used for the real `rm`. Reports numbers and PASS/FAIL, nothing to copy.
+# Two candidates both verified via a read-only `get` last time - could be a
+# genuine duplicate record (leftover from earlier test rounds - we've run a
+# lot of these), or one candidate giving a false-positive match. This
+# narrows it down by actually deleting one candidate at a time and
+# rechecking `ls` after each - the only thing that tells us, for certain,
+# whether a given UID controls the folder's visible copy of the record.
 #
 #   export KEEPER_CONFIG=/path/to/your/config.json
 #   export KEEPER_FOLDER="Sftp-Keys"
-#   bash keeper-delete-verify.sh
+#   bash keeper-delete-narrow.sh
 
 set -uo pipefail
 : "${KEEPER_CONFIG:?set KEEPER_CONFIG=/path/to/your/config.json}"
@@ -17,16 +18,25 @@ KEEPER_CLI="${KEEPER_CLI:-keeper}"
 TEST_USER="${KEEPER_TEST_USER:-smoketest123}"
 
 uid_candidates() { grep -oE '[A-Za-z0-9_-]{20,}' <<<"$1" | sort -u; }
+visible_in_folder() {
+  local out
+  out="$("$KEEPER_CLI" --config="$KEEPER_CONFIG" "ls \"$KEEPER_FOLDER\"" 2>&1)"
+  grep -qF "$TEST_USER" <<<"$out"
+}
 
 banner() { printf '\n========== %s ==========\n' "$1"; }
 
-banner "SETUP: (re)create the test record"
-fake_priv_b64="$(printf -- '-----BEGIN OPENSSH PRIVATE KEY-----\nFAKE\n-----END OPENSSH PRIVATE KEY-----\n' | base64 | tr -d '\n')"
-cmd="record-add --title \"$TEST_USER\" --record-type login --force --folder \"$KEEPER_FOLDER\""
-cmd="$cmd \"login=$TEST_USER\" \"c.secret.private_key_b64=$fake_priv_b64\""
-"$KEEPER_CLI" --config="$KEEPER_CONFIG" "$cmd" >/dev/null 2>&1
+banner "SETUP: ensure the test record exists"
+if ! visible_in_folder; then
+  fake_priv_b64="$(printf -- '-----BEGIN OPENSSH PRIVATE KEY-----\nFAKE\n-----END OPENSSH PRIVATE KEY-----\n' | base64 | tr -d '\n')"
+  cmd="record-add --title \"$TEST_USER\" --record-type login --force --folder \"$KEEPER_FOLDER\""
+  cmd="$cmd \"login=$TEST_USER\" \"c.secret.private_key_b64=$fake_priv_b64\""
+  "$KEEPER_CLI" --config="$KEEPER_CONFIG" "$cmd" >/dev/null 2>&1
+fi
+visible_in_folder || { echo "could not (re)create the test record - stopping"; exit 1; }
+echo "confirmed visible in $KEEPER_FOLDER"
 
-banner "COLLECTING CANDIDATES (no output shown - just gathering)"
+banner "COLLECTING VERIFIED CANDIDATES"
 all=""
 for c in \
   "search \"$TEST_USER\"" \
@@ -39,49 +49,44 @@ do
 $(uid_candidates "$out")"
 done
 candidates="$(sort -u <<<"$all" | grep -v '^$')"
-n="$(grep -c . <<<"$candidates" 2>/dev/null || echo 0)"
-echo "Found $n candidate(s) total."
 
-if [[ "$n" -eq 0 ]]; then
-  banner "RESULT"
-  echo "0 candidates found anywhere - nothing to verify. Delete the test"
-  echo "record by hand for now; a different approach is needed here."
-  exit 0
-fi
-
-banner "VERIFYING EACH CANDIDATE (read-only 'get' - nothing destructive yet)"
 verified=""
-i=0
 while IFS= read -r uid; do
-  i=$((i+1))
+  [[ -z "$uid" ]] && continue
   out="$("$KEEPER_CLI" --config="$KEEPER_CONFIG" "get $uid --format=json" 2>&1)"
-  if grep -qF "$TEST_USER" <<<"$out"; then
-    echo "candidate $i: MATCHES our test record"
-    verified="$verified
+  grep -qF "$TEST_USER" <<<"$out" && verified="$verified
 $uid"
-  else
-    echo "candidate $i: does not match (unrelated record, or lookup failed)"
-  fi
 done <<<"$candidates"
 verified="$(sort -u <<<"$verified" | grep -v '^$')"
 vn="$(grep -c . <<<"$verified" 2>/dev/null || echo 0)"
+echo "$vn candidate(s) verified: re-narrowing by actually deleting one at a time"
+
+banner "NARROWING - delete one candidate, recheck ls, repeat only if still visible"
+i=0
+resolved=0
+while IFS= read -r uid; do
+  [[ -z "$uid" ]] && continue
+  i=$((i+1))
+  if ! visible_in_folder; then
+    echo "candidate $i: skipped - record already gone (an earlier candidate resolved it)"
+    continue
+  fi
+  "$KEEPER_CLI" --config="$KEEPER_CONFIG" "rm -f $uid" >/dev/null 2>&1
+  if visible_in_folder; then
+    echo "candidate $i: deleted it, but the record is STILL visible - this UID was a false positive, not the real controlling one"
+  else
+    echo "candidate $i: deleted it, record is now GONE - this is the real UID"
+    resolved=1
+  fi
+done <<<"$verified"
 
 banner "RESULT"
-if [[ "$vn" -eq 0 ]]; then
-  echo "0 of $n candidates verified. None of them actually resolve to our"
-  echo "test record via 'get'. Delete the test record by hand for now."
-elif [[ "$vn" -eq 1 ]]; then
-  echo "Exactly 1 candidate verified. Deleting the test record with it..."
-  "$KEEPER_CLI" --config="$KEEPER_CONFIG" "rm -f $verified" >/dev/null 2>&1
-  after="$("$KEEPER_CLI" --config="$KEEPER_CONFIG" "ls \"$KEEPER_FOLDER\"" 2>&1)"
-  if grep -qF "$TEST_USER" <<<"$after"; then
-    echo "VERDICT: rm ran but the record is STILL there. Report: FAILED."
-  else
-    echo "VERDICT: SUCCESS - verified match, deleted, and confirmed gone."
-    echo "Just tell me: SUCCESS. That's all I need."
-  fi
+if visible_in_folder; then
+  echo "The test record is still visible after trying every verified candidate."
+  echo "None of them actually control the folder's copy. Report: NONE WORKED."
 else
-  echo "$vn candidates all verified as matching (unusual - might mean"
-  echo "duplicate records exist). Not deleting automatically - this needs"
-  echo "a closer look. Report: $vn verified, ambiguous."
+  echo "The test record is gone. Report: RESOLVED."
+  if [[ $resolved -eq 1 ]]; then
+    echo "(exactly one candidate was the real UID - a clean result)"
+  fi
 fi

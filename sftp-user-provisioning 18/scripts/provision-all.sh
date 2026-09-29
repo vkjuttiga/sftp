@@ -1,18 +1,20 @@
 #!/usr/bin/env bash
 #
-# Reads users.yaml, validates it, and provisions each user via
-# provision-user.sh. See README for setup and details.
+# Reads users.yaml (or delete.yaml, for delete) and provisions or deletes
+# each user via provision-user.sh. See README for setup and details.
 #
-#   provision-all.sh validate|plan|apply
+#   provision-all.sh validate|plan|apply|delete
 
 set -euo pipefail
 
-MODE="${1:?usage: $0 <validate|plan|apply>}"
-[[ "$MODE" == "validate" || "$MODE" == "plan" || "$MODE" == "apply" ]] \
-  || { echo "mode must be validate, plan or apply" >&2; exit 2; }
+MODE="${1:?usage: $0 <validate|plan|apply|delete>}"
+[[ "$MODE" == "validate" || "$MODE" == "plan" || "$MODE" == "apply" || "$MODE" == "delete" ]] \
+  || { echo "mode must be validate, plan, apply or delete" >&2; exit 2; }
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CONFIG_FILE="${CONFIG_FILE:-$here/../users.yaml}"
+default_file="$here/../users.yaml"
+[[ "$MODE" == "delete" ]] && default_file="$here/../delete.yaml"
+CONFIG_FILE="${CONFIG_FILE:-$default_file}"
 EXIT_SKIPPED=10
 
 log() { printf '==> %s\n' "$*"; }
@@ -22,6 +24,11 @@ log "mode=$MODE"
 log "reading $CONFIG_FILE"
 
 [[ -f "$CONFIG_FILE" ]] || fail "config file not found: $CONFIG_FILE"
+
+log "checking for trailing whitespace"
+bad_lines="$(grep -n '[[:space:]]$' "$CONFIG_FILE" || true)"
+[[ -z "$bad_lines" ]] || fail "trailing whitespace on line(s):
+$bad_lines"
 
 # YAML -> JSON -> one "name:path" line per entry (names and paths can't contain ':').
 log "parsing users.yaml"
@@ -37,7 +44,11 @@ names=()
 paths=()
 seen=" "
 
-log "validating entries (name and path both required, no duplicate names)"
+if [[ "$MODE" == "delete" ]]; then
+  log "validating entries (name required, no duplicate names; path optional)"
+else
+  log "validating entries (name and path both required, no duplicate names)"
+fi
 while IFS= read -r entry; do
   [[ -z "$entry" ]] && continue
 
@@ -47,7 +58,9 @@ while IFS= read -r entry; do
   path="${path%/}"
 
   [[ -n "$user" ]] || fail "an entry is missing 'name'"
-  [[ -n "$path" ]] || fail "user '$user' has no path - every user needs an explicit path"
+  if [[ "$MODE" != "delete" ]]; then
+    [[ -n "$path" ]] || fail "user '$user' has no path - every user needs an explicit path"
+  fi
   [[ "$seen" != *" $user "* ]] || fail "user '$user' is listed twice"
 
   seen+="$user "
@@ -61,7 +74,13 @@ if [[ ${#names[@]} -eq 0 ]]; then
 fi
 
 log "validated ${#names[@]} user(s) from $(basename "$CONFIG_FILE"):"
-for i in "${!names[@]}"; do printf '  %s -> %s\n' "${names[$i]}" "${paths[$i]}"; done
+for i in "${!names[@]}"; do
+  if [[ -n "${paths[$i]}" ]]; then
+    printf '  %s -> %s\n' "${names[$i]}" "${paths[$i]}"
+  else
+    printf '  %s\n' "${names[$i]}"
+  fi
+done
 
 [[ "$MODE" != "validate" ]] || { log "validate-only mode, stopping here"; exit 0; }
 
@@ -74,7 +93,11 @@ for i in "${!names[@]}"; do
   path="${paths[$i]}"
 
   log "----- $user -----"
-  log "provisioning '$user' -> '$path' (mode=$MODE)"
+  if [[ -n "$path" ]]; then
+    log "$MODE '$user' -> '$path'"
+  else
+    log "$MODE '$user'"
+  fi
   rc=0
   bash "$here/provision-user.sh" "$MODE" "$user" "$path" || rc=$?
   case "$rc" in
@@ -86,10 +109,14 @@ done
 
 verb="Created"
 [[ "$MODE" == "plan" ]] && verb="Would create"
+[[ "$MODE" == "delete" ]] && verb="Deleted"
+
+skip_label="Skipped (already exist)"
+[[ "$MODE" == "delete" ]] && skip_label="Skipped (already gone)"
 
 echo
 log "$verb: ${created[*]:-none}"
-log "Skipped (already exist): ${skipped[*]:-none}"
+log "$skip_label: ${skipped[*]:-none}"
 log "Failed: ${failed[*]:-none}"
 
 [[ ${#failed[@]} -eq 0 ]]

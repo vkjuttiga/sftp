@@ -1,0 +1,15 @@
+# Users to delete - both their AWS Transfer Family account and their
+# Keeper record. One entry per user:
+#   name - SFTP username
+#   path - optional. If given, must match their current S3 folder exactly
+#          (a safety check against deleting the wrong user by typo). Leave
+#          it out to delete by username alone.
+#
+# Run: bash scripts/provision-all.sh delete
+#
+# This is destructive and immediate - there is no "plan" mode for delete.
+#
+# users:
+#   - name: acme
+
+users: []

@@ -222,9 +222,15 @@ check_existing_user() {
 
 generate_keys() {
   log "generating $KEY_TYPE key pair"
-  local bits=()
-  [[ "$KEY_TYPE" == "rsa" ]] && bits=(-b 4096)
-  ssh-keygen -q -t "$KEY_TYPE" ${bits[@]+"${bits[@]}"} -N "" -C "sftp-${USER_NAME}" -f "$KEY"
+  local bits=() fmt=()
+  if [[ "$KEY_TYPE" == "rsa" ]]; then
+    bits=(-b 4096)
+    # Classic PEM format ("-----BEGIN RSA PRIVATE KEY-----"), not the newer
+    # OpenSSH container format - several GUI SFTP clients (Cyberduck,
+    # FileZilla, older WinSCP/PuTTY) only accept the former.
+    fmt=(-m PEM)
+  fi
+  ssh-keygen -q -t "$KEY_TYPE" ${bits[@]+"${bits[@]}"} ${fmt[@]+"${fmt[@]}"} -N "" -C "sftp-${USER_NAME}" -f "$KEY"
   chmod 600 "$KEY"
 }
 

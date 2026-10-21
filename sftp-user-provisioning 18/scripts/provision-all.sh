@@ -23,7 +23,7 @@ fail() { echo "ERROR: $*" >&2; exit 1; }
 log "mode=$MODE"
 log "reading $CONFIG_FILE"
 
-[[ -f "$CONFIG_FILE" ]] || fail "config file not found: $CONFIG_FILE"
+[[ -f "$CONFIG_FILE" ]] || fail "config file not found: $CONFIG_FILE" 
 
 log "checking for trailing whitespace"
 bad_lines="$(grep -n '[[:space:]]$' "$CONFIG_FILE" || true)"

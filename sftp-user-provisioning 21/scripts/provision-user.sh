@@ -120,7 +120,8 @@ $uid"
 # Filed flat in KEEPER_FOLDER, titled with the username (see README - no
 # per-user subfolder). The private key goes in twice: base64-encoded in a
 # custom field (for scripted retrieval), and as a real file attachment
-# named like a normal SSH key - so it can be downloaded as-is from the
+# named "<username>_id_<type>" so it doesn't collide with other users'
+# downloads - so it can be downloaded as-is from the
 # Keeper UI, no decoding needed. The attachment is best-effort: the field
 # above is what resume-tracking relies on, so a failed attachment is logged
 # but doesn't fail the whole upload.
@@ -138,7 +139,7 @@ keeper_upload_key() {
     return 1
   fi
 
-  local attach_file="$WORK/id_${KEY_TYPE}" attach_out uid
+  local attach_file="$WORK/${USER_NAME}_id_${KEY_TYPE}" attach_out uid
   cp "$KEY" "$attach_file"
   # upload-attachment's bare title always fails ("record UID not found" -
   # Commander treats the title text itself as a UID rather than resolving

@@ -81,22 +81,28 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Collects UID-shaped candidates from several discovery methods and
-# read-verifies each against the record before trusting it - `ls -v`
-# exposes no UID on this Commander version, and some of these methods
-# search the whole vault, not just one folder, so a same-titled record
-# elsewhere could otherwise produce a false match. Prints the verified UID
-# (one per line if more than one truly matches) or nothing if none do.
+# `ls -l` on the folder is the confirmed-working way to see a UID next to
+# a title - folder-scoped (unlike search, which spans the whole vault) and
+# already proven in manual use. Tried first; `search`/`list`/`get` on the
+# bare title are a fallback if it doesn't turn one up. Every candidate is
+# still read-verified against the record before being trusted. Prints the
+# verified UID (one per line if more than one truly matches) or nothing.
 keeper_find_uid() {
-  local candidates uid verified out
-  candidates="$(
-    {
-      "$KEEPER_CLI" --config="$KEEPER_CONFIG" "search \"$RECORD_TITLE\"" 2>&1
-      "$KEEPER_CLI" --config="$KEEPER_CONFIG" "list --format=json \"$RECORD_TITLE\"" 2>&1
-      "$KEEPER_CLI" --config="$KEEPER_CONFIG" "get \"$RECORD_TITLE\"" 2>&1
-      "$KEEPER_CLI" --config="$KEEPER_CONFIG" "get \"$RECORD_TITLE\" --format=json" 2>&1
-    } | grep -oE '[A-Za-z0-9_-]{20,}' | sort -u
-  )"
+  local candidates uid verified out line
+
+  line="$("$KEEPER_CLI" --config="$KEEPER_CONFIG" "ls -l \"$KEEPER_FOLDER\"" 2>&1 | grep -F "$RECORD_TITLE")"
+  candidates="$(grep -oE '[A-Za-z0-9_-]{20,}' <<<"$line" | sort -u)"
+
+  if [[ -z "$candidates" ]]; then
+    candidates="$(
+      {
+        "$KEEPER_CLI" --config="$KEEPER_CONFIG" "search \"$RECORD_TITLE\"" 2>&1
+        "$KEEPER_CLI" --config="$KEEPER_CONFIG" "list --format=json \"$RECORD_TITLE\"" 2>&1
+        "$KEEPER_CLI" --config="$KEEPER_CONFIG" "get \"$RECORD_TITLE\"" 2>&1
+        "$KEEPER_CLI" --config="$KEEPER_CONFIG" "get \"$RECORD_TITLE\" --format=json" 2>&1
+      } | grep -oE '[A-Za-z0-9_-]{20,}' | sort -u
+    )"
+  fi
   [[ -n "$candidates" ]] || return 1
 
   verified=""
@@ -132,23 +138,19 @@ keeper_upload_key() {
     return 1
   fi
 
-  local attach_file="$WORK/id_${KEY_TYPE}" attach_out
+  local attach_file="$WORK/id_${KEY_TYPE}" attach_out uid
   cp "$KEY" "$attach_file"
-  if attach_out="$("$KEEPER_CLI" --config="$KEEPER_CONFIG" \
-      "upload-attachment --file \"$attach_file\" \"$RECORD_TITLE\"" 2>&1)"; then
+  # upload-attachment's bare title always fails ("record UID not found" -
+  # Commander treats the title text itself as a UID rather than resolving
+  # it), so this goes straight to UID lookup rather than wasting a call.
+  uid="$(keeper_find_uid | head -1)"
+  if [[ -z "$uid" ]]; then
+    log "WARNING: could not attach a downloadable copy - no UID found. Key is still in the private_key_b64 field"
+  elif attach_out="$("$KEEPER_CLI" --config="$KEEPER_CONFIG" \
+      "upload-attachment --file \"$attach_file\" $uid" 2>&1)"; then
     log "attached a downloadable copy of the key"
   else
-    log "attachment by title failed: $(tail -n 1 <<<"$attach_out") - retrying by UID"
-    local uid
-    uid="$(keeper_find_uid | head -1)"
-    if [[ -z "$uid" ]]; then
-      log "WARNING: could not attach a downloadable copy - no UID found to retry with. Key is still in the private_key_b64 field"
-    elif attach_out="$("$KEEPER_CLI" --config="$KEEPER_CONFIG" \
-        "upload-attachment --file \"$attach_file\" $uid" 2>&1)"; then
-      log "attached a downloadable copy of the key"
-    else
-      log "WARNING: could not attach a downloadable copy - $(tail -n 1 <<<"$attach_out"). Key is still in the private_key_b64 field"
-    fi
+    log "WARNING: could not attach a downloadable copy - $(tail -n 1 <<<"$attach_out"). Key is still in the private_key_b64 field"
   fi
 
   log "Keeper upload succeeded"

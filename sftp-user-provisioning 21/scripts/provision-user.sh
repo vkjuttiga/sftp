@@ -132,19 +132,22 @@ keeper_upload_key() {
     return 1
   fi
 
-  local attach_file="$WORK/id_${KEY_TYPE}"
+  local attach_file="$WORK/id_${KEY_TYPE}" attach_out
   cp "$KEY" "$attach_file"
-  if "$KEEPER_CLI" --config="$KEEPER_CONFIG" \
-      "upload-attachment --file \"$attach_file\" \"$RECORD_TITLE\"" >/dev/null 2>&1; then
+  if attach_out="$("$KEEPER_CLI" --config="$KEEPER_CONFIG" \
+      "upload-attachment --file \"$attach_file\" \"$RECORD_TITLE\"" 2>&1)"; then
     log "attached a downloadable copy of the key"
   else
+    log "attachment by title failed: $(tail -n 1 <<<"$attach_out") - retrying by UID"
     local uid
     uid="$(keeper_find_uid | head -1)"
-    if [[ -n "$uid" ]] && "$KEEPER_CLI" --config="$KEEPER_CONFIG" \
-        "upload-attachment --file \"$attach_file\" $uid" >/dev/null 2>&1; then
+    if [[ -z "$uid" ]]; then
+      log "WARNING: could not attach a downloadable copy - no UID found to retry with. Key is still in the private_key_b64 field"
+    elif attach_out="$("$KEEPER_CLI" --config="$KEEPER_CONFIG" \
+        "upload-attachment --file \"$attach_file\" $uid" 2>&1)"; then
       log "attached a downloadable copy of the key"
     else
-      log "WARNING: could not attach a downloadable copy - the key is still in the private_key_b64 field"
+      log "WARNING: could not attach a downloadable copy - $(tail -n 1 <<<"$attach_out"). Key is still in the private_key_b64 field"
     fi
   fi
 

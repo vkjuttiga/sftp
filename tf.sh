@@ -4,13 +4,13 @@
 # keeps it only in memory, and deletes it when the session ends.
 #
 # Usage: TF_HOST=s-XXXXXXXX.server.transfer.<region>.amazonaws.com ./tf-login.sh <username>
-# Optional: FIELD_LABEL=<custom field label> (default: private_key)
+# Optional: RECORD=<record title or UID> (default: the username)
 
 set -uo pipefail
 
 USER_NAME="${1:?Usage: $0 <username>}"
 TF_HOST="${TF_HOST:?Set TF_HOST to the Transfer Family endpoint}"
-FIELD_LABEL="${FIELD_LABEL:-private_key}"
+RECORD="${RECORD:-$USER_NAME}"
 
 # Memory-backed temp location (falls back to /tmp where /dev/shm is not available)
 TMP_DIR=/dev/shm; [ -d "$TMP_DIR" ] || TMP_DIR=/tmp
@@ -19,16 +19,20 @@ chmod 600 "$KEY"
 cleanup() { shred -u "$KEY" "$KEY.raw" "$KEY.pub" 2>/dev/null || rm -f "$KEY" "$KEY.raw" "$KEY.pub"; }
 trap cleanup EXIT
 
-echo ">> Fetching private key for '$USER_NAME' from Keeper"
-keeper get "$USER_NAME" --format json \
-  | jq -r --arg l "$FIELD_LABEL" '
-      [(.fields[]?, .custom[]?)
-       | select(.type == "keyPair" or .label == $l)
-       | .value[0]
-       | if type == "object" then .privateKey else . end][0] // empty' > "$KEY.raw"
+echo ">> Fetching Keeper record '$RECORD'"
+JSON=$(keeper get "$RECORD" --format json 2>/dev/null || true)
+if [ -z "$JSON" ] || ! echo "$JSON" | jq -e . >/dev/null 2>&1; then
+  echo "!! Keeper record '$RECORD' not found. Find its UID with: keeper search $USER_NAME"
+  echo "   then rerun with: RECORD=<record_uid> $0 $USER_NAME"; exit 1
+fi
+
+echo ">> Extracting private key (searching all fields: password, notes, custom)"
+# Finds the first value anywhere in the record that contains "PRIVATE KEY",
+# whatever field it was stored in (Login record password field, notes, custom field).
+echo "$JSON" | jq -r '[.. | strings | select(test("PRIVATE KEY"))][0] // empty' > "$KEY.raw"
 
 if [ ! -s "$KEY.raw" ]; then
-  echo "!! No private key found in Keeper record '$USER_NAME' (field label: $FIELD_LABEL)"; exit 1
+  echo "!! No value containing 'PRIVATE KEY' found in record '$RECORD'"; exit 1
 fi
 
 echo ">> Repairing key format"

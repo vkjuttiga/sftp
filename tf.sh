@@ -5,12 +5,14 @@
 #
 # Usage: TF_HOST=s-XXXXXXXX.server.transfer.<region>.amazonaws.com ./tf-login.sh <username>
 # Optional: RECORD=<record title or UID> (default: the username)
+#           B64_LABEL=<field holding the base64-encoded key> (default: private_key_b64)
 
 set -uo pipefail
 
 USER_NAME="${1:?Usage: $0 <username>}"
 TF_HOST="${TF_HOST:?Set TF_HOST to the Transfer Family endpoint}"
 RECORD="${RECORD:-$USER_NAME}"
+B64_LABEL="${B64_LABEL:-private_key_b64}"
 
 # Memory-backed temp location (falls back to /tmp where /dev/shm is not available)
 TMP_DIR=/dev/shm; [ -d "$TMP_DIR" ] || TMP_DIR=/tmp
@@ -26,13 +28,22 @@ if [ -z "$JSON" ] || ! echo "$JSON" | jq -e . >/dev/null 2>&1; then
   echo "   then rerun with: RECORD=<record_uid> $0 $USER_NAME"; exit 1
 fi
 
-echo ">> Extracting private key (searching all fields: password, notes, custom)"
-# Finds the first value anywhere in the record that contains "PRIVATE KEY",
-# whatever field it was stored in (Login record password field, notes, custom field).
-echo "$JSON" | jq -r '[.. | strings | select(test("PRIVATE KEY"))][0] // empty' > "$KEY.raw"
+echo ">> Extracting private key from field '$B64_LABEL' (base64-encoded)"
+B64=$(echo "$JSON" | jq -r --arg l "$B64_LABEL" \
+  '[(.fields[]?, .custom[]?) | select(.label == $l) | .value[0]][0] // empty')
+if [ -n "$B64" ]; then
+  echo ">> Decoding base64"
+  if ! echo "$B64" | tr -d ' \r\n"' | base64 -d > "$KEY.raw" 2>/dev/null; then
+    echo "!! Field '$B64_LABEL' is not valid base64"; exit 1
+  fi
+else
+  echo ">> Field '$B64_LABEL' not found - searching all fields for a plain-text key"
+  # Finds the first value anywhere in the record that contains "PRIVATE KEY".
+  echo "$JSON" | jq -r '[.. | strings | select(test("PRIVATE KEY"))][0] // empty' > "$KEY.raw"
+fi
 
-if [ ! -s "$KEY.raw" ]; then
-  echo "!! No value containing 'PRIVATE KEY' found in record '$RECORD'"; exit 1
+if [ ! -s "$KEY.raw" ] || ! grep -q "PRIVATE KEY" "$KEY.raw"; then
+  echo "!! No private key found in record '$RECORD'"; exit 1
 fi
 
 echo ">> Repairing key format"

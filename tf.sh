@@ -56,8 +56,18 @@ chmod 600 "$KEY"
 cleanup() { shred -u "$KEY" "$KEY.raw" "$KEY.pub" 2>/dev/null || rm -f "$KEY" "$KEY.raw" "$KEY.pub"; }
 trap cleanup EXIT
 
+REFS=("$RECORD" "$KEEPER_FOLDER/$RECORD")
+echo ">> Looking up record UID for '$RECORD' in folder '$KEEPER_FOLDER'"
+UID_FOUND=$(timeout 60 "${KEEPER[@]}" ls -l "$KEEPER_FOLDER" </dev/null 2>/dev/null \
+  | awk -v t="$RECORD" '{ hit = 0; for (i = 1; i <= NF; i++) if ($i == t) hit = 1
+      if (hit) for (i = 1; i <= NF; i++) if ($i ~ /^[A-Za-z0-9_-]{22}$/) { print $i; exit } }' || true)
+if [ -n "$UID_FOUND" ]; then
+  echo ">> Found record UID: $UID_FOUND"
+  REFS=("$UID_FOUND" "${REFS[@]}")
+fi
+
 JSON=""
-for ref in "$RECORD" "$KEEPER_FOLDER/$RECORD"; do
+for ref in "${REFS[@]}"; do
   echo ">> Fetching Keeper record '$ref'"
   JSON=$(timeout 60 "${KEEPER[@]}" get "$ref" --format json </dev/null 2>/dev/null || true)
   if [ -n "$JSON" ] && echo "$JSON" | jq -e . >/dev/null 2>&1; then break; fi

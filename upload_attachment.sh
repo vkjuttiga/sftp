@@ -1,14 +1,13 @@
 #!/usr/bin/env bash
 #
-# Tests whether Commander can attach a real local FILE to a record (instead
-# of a text field) - if so, the Keeper UI can offer a direct file download
-# with the exact original key bytes, no base64/decode step needed at all.
-# Tries a few plausible command forms, since the exact syntax isn't
-# something I can know in advance.
+# upload-attachment's real usage is: upload-attachment --file <path> <record>
+# - a positional, not --record. Tries it with the bare title first, then
+# with the record's UID (found the same proven way as deletion), since we
+# don't yet know which one "record" actually wants.
 #
 #   export KEEPER_CONFIG=/path/to/your/config.json
 #   export KEEPER_FOLDER="Sftp-Keys"
-#   bash keeper-attachment-test.sh
+#   bash keeper-attachment-test2.sh
 
 set -uo pipefail
 : "${KEEPER_CONFIG:?set KEEPER_CONFIG=/path/to/your/config.json}"
@@ -17,49 +16,56 @@ KEEPER_CLI="${KEEPER_CLI:-keeper}"
 TEST_USER="${KEEPER_TEST_USER:-smoketest123}"
 
 banner() { printf '\n========== %s ==========\n' "$1"; }
-try() {
-  banner "$1"; shift
-  printf 'COMMAND: %s\n---\n' "$*"
-  "$@" 2>&1
-  printf -- '---\n'
-}
 
-# A real-shaped (but fake) PEM file, on disk, so Commander reads it as an
-# actual file rather than us embedding its content in a command string.
 KEYFILE="$(mktemp)"
-printf -- '-----BEGIN OPENSSH PRIVATE KEY-----\nFAKE-ATTACHMENT-TEST-KEY-MULTILINE\nANOTHER-LINE-OF-FAKE-DATA\n-----END OPENSSH PRIVATE KEY-----\n' > "$KEYFILE"
+printf -- '-----BEGIN OPENSSH PRIVATE KEY-----\nFAKE-ATTACH-TEST\n-----END OPENSSH PRIVATE KEY-----\n' > "$KEYFILE"
 
-banner "SETUP: create the test record (no key field yet - attachment only)"
+banner "SETUP: create the test record"
 "$KEEPER_CLI" --config="$KEEPER_CONFIG" \
   "record-add --title \"$TEST_USER\" --record-type login --force --folder \"$KEEPER_FOLDER\" \"login=$TEST_USER\""
 
-try "ATTEMPT 1: help for 'upload-attachment' (read its real usage, if it exists)" \
-  "$KEEPER_CLI" --config="$KEEPER_CONFIG" "upload-attachment --help"
+banner "ATTEMPT A: upload-attachment --file <path> <bare title>"
+printf 'COMMAND: upload-attachment --file "%s" "%s"\n---\n' "$KEYFILE" "$TEST_USER"
+"$KEEPER_CLI" --config="$KEEPER_CONFIG" "upload-attachment --file \"$KEYFILE\" \"$TEST_USER\""
+echo "exit: $?"
+printf -- '---\n'
 
-try "ATTEMPT 2: upload-attachment --file <path> --record <title>" \
-  "$KEEPER_CLI" --config="$KEEPER_CONFIG" "upload-attachment --file \"$KEYFILE\" --record \"$TEST_USER\""
+banner "Finding the record's UID (same proven method as deletion)"
+candidates="$(
+  {
+    "$KEEPER_CLI" --config="$KEEPER_CONFIG" "search \"$TEST_USER\"" 2>&1
+    "$KEEPER_CLI" --config="$KEEPER_CONFIG" "list --format=json \"$TEST_USER\"" 2>&1
+    "$KEEPER_CLI" --config="$KEEPER_CONFIG" "get \"$TEST_USER\"" 2>&1
+    "$KEEPER_CLI" --config="$KEEPER_CONFIG" "get \"$TEST_USER\" --format=json" 2>&1
+  } | grep -oE '[A-Za-z0-9_-]{20,}' | sort -u
+)"
+uid=""
+while IFS= read -r c; do
+  [[ -z "$c" ]] && continue
+  out="$("$KEEPER_CLI" --config="$KEEPER_CONFIG" "get $c --format=json" 2>&1)"
+  if grep -qF "$TEST_USER" <<<"$out"; then uid="$c"; break; fi
+done <<<"$candidates"
 
-try "ATTEMPT 3: record-add's own --attach option, if it has one" \
-  "$KEEPER_CLI" --config="$KEEPER_CONFIG" "record-add --help"
+if [[ -z "$uid" ]]; then
+  echo "could not resolve a UID this time - skipping ATTEMPT B"
+else
+  echo "resolved UID: $uid"
+  banner "ATTEMPT B: upload-attachment --file <path> <uid>"
+  printf 'COMMAND: upload-attachment --file "%s" %s\n---\n' "$KEYFILE" "$uid"
+  "$KEEPER_CLI" --config="$KEEPER_CONFIG" "upload-attachment --file \"$KEYFILE\" $uid"
+  echo "exit: $?"
+  printf -- '---\n'
+fi
 
 banner "WHAT TO DO NEXT"
 cat <<'EOF'
-If ATTEMPT 1 printed real usage text (not "unknown command"), that confirms
-upload-attachment exists - tell me what its actual options are (or just
-that it printed something real) and I'll match the syntax exactly.
-
-If ATTEMPT 2 looks like it succeeded (no error, or a confirmation message),
-open the Keeper app/UI, find the 'smoketest123' record in Sftp-Keys, and
-check: does it show a file attachment you can download? That visual check
-in the UI is the real confirmation - tell me yes or no.
-
-If both attempts clearly failed ("unknown command" or similar), attachments
-aren't something this CLI supports non-interactively, and we'll stick with
-the base64 field - I'll instead make the manual copy-paste steps as safe
-and foolproof as possible.
+Open the Keeper app/UI now and look at the 'smoketest123' record in
+Sftp-Keys. Does it show a file attachment you can download? If yes, tell me
+which ATTEMPT (A or B) you think caused it - or just "yes, attachment
+present" if you're not sure which. If no attachment shows up at all, tell
+me that too, along with whichever of A/B printed exit: 0 vs a nonzero exit.
 EOF
 
-banner "CLEANUP"
-"$KEEPER_CLI" --config="$KEEPER_CONFIG" "rm -f \"$KEEPER_FOLDER/$TEST_USER\"" 2>&1 \
-  || echo "(cleanup via folder/title failed as expected - delete '$TEST_USER' by hand if needed)"
+banner "CLEANUP (leaves the record itself - delete separately if you want)"
+echo "(not auto-deleting this time, in case you want to inspect it first)"
 rm -f "$KEYFILE"

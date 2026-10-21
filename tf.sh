@@ -6,6 +6,10 @@
 # Usage: TF_HOST=s-XXXXXXXX.server.transfer.<region>.amazonaws.com ./tf-login.sh <username>
 # Optional: RECORD=<record title or UID> (default: the username)
 #           B64_LABEL=<field holding the base64-encoded key> (default: private_key_b64)
+#           KEEPER_VENV=<path to the Commander virtualenv> (default: ~/keeper-venv)
+#           KEEPER_USER=<Keeper login email> (used only if a login is needed)
+#           KEEPER_FOLDER=<Keeper folder name or UID holding the records> (default: Sftp-Keys)
+#           KEEPER_CONFIG=<Commander config.json with your saved session> (default: ~/.keeper/config.json)
 
 set -uo pipefail
 
@@ -13,6 +17,37 @@ USER_NAME="${1:?Usage: $0 <username>}"
 TF_HOST="${TF_HOST:?Set TF_HOST to the Transfer Family endpoint}"
 RECORD="${RECORD:-$USER_NAME}"
 B64_LABEL="${B64_LABEL:-private_key_b64}"
+KEEPER_VENV="${KEEPER_VENV:-$HOME/keeper-venv}"
+KEEPER_FOLDER="${KEEPER_FOLDER:-Sftp-Keys}"
+KEEPER_CONFIG="${KEEPER_CONFIG:-$HOME/.keeper/config.json}"
+
+echo ">> Preparing Keeper Commander"
+if ! command -v keeper >/dev/null 2>&1; then
+  if [ -f "$KEEPER_VENV/bin/activate" ]; then
+    echo ">> Activating Commander virtualenv: $KEEPER_VENV"
+    # shellcheck disable=SC1091
+    source "$KEEPER_VENV/bin/activate"
+  fi
+fi
+command -v keeper >/dev/null 2>&1 || { echo "!! 'keeper' not found. Set KEEPER_VENV to your Commander virtualenv"; exit 1; }
+
+# Use the existing config.json so Commander reuses the saved (persistent) session
+KEEPER=(keeper)
+if [ -f "$KEEPER_CONFIG" ]; then
+  echo ">> Using Keeper config: $KEEPER_CONFIG"
+  KEEPER+=(--config "$KEEPER_CONFIG")
+else
+  echo ">> Keeper config not found at $KEEPER_CONFIG - using Commander's default"
+fi
+
+echo ">> Checking Keeper session"
+if ! timeout 60 "${KEEPER[@]}" whoami </dev/null >/dev/null 2>&1; then
+  echo ">> No active Keeper session - logging in (enter password / 2FA when prompted)"
+  if [ -n "${KEEPER_USER:-}" ]; then "${KEEPER[@]}" login "$KEEPER_USER"; else "${KEEPER[@]}" login; fi \
+    || { echo "!! Keeper login failed"; exit 1; }
+  echo ">> Tip: run 'keeper this-device persistent-login on' once to skip this next time"
+fi
+echo ">> Keeper session OK"
 
 # Memory-backed temp location (falls back to /tmp where /dev/shm is not available)
 TMP_DIR=/dev/shm; [ -d "$TMP_DIR" ] || TMP_DIR=/tmp
@@ -21,9 +56,14 @@ chmod 600 "$KEY"
 cleanup() { shred -u "$KEY" "$KEY.raw" "$KEY.pub" 2>/dev/null || rm -f "$KEY" "$KEY.raw" "$KEY.pub"; }
 trap cleanup EXIT
 
-echo ">> Fetching Keeper record '$RECORD'"
-JSON=$(keeper get "$RECORD" --format json 2>/dev/null || true)
-if [ -z "$JSON" ] || ! echo "$JSON" | jq -e . >/dev/null 2>&1; then
+JSON=""
+for ref in "$RECORD" "$KEEPER_FOLDER/$RECORD"; do
+  echo ">> Fetching Keeper record '$ref'"
+  JSON=$(timeout 60 "${KEEPER[@]}" get "$ref" --format json </dev/null 2>/dev/null || true)
+  if [ -n "$JSON" ] && echo "$JSON" | jq -e . >/dev/null 2>&1; then break; fi
+  JSON=""
+done
+if [ -z "$JSON" ]; then
   echo "!! Keeper record '$RECORD' not found. Find its UID with: keeper search $USER_NAME"
   echo "   then rerun with: RECORD=<record_uid> $0 $USER_NAME"; exit 1
 fi

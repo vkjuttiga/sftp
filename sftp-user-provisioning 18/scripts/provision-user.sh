@@ -81,8 +81,43 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Collects UID-shaped candidates from several discovery methods and
+# read-verifies each against the record before trusting it - `ls -v`
+# exposes no UID on this Commander version, and some of these methods
+# search the whole vault, not just one folder, so a same-titled record
+# elsewhere could otherwise produce a false match. Prints the verified UID
+# (one per line if more than one truly matches) or nothing if none do.
+keeper_find_uid() {
+  local candidates uid verified out
+  candidates="$(
+    {
+      "$KEEPER_CLI" --config="$KEEPER_CONFIG" "search \"$RECORD_TITLE\"" 2>&1
+      "$KEEPER_CLI" --config="$KEEPER_CONFIG" "list --format=json \"$RECORD_TITLE\"" 2>&1
+      "$KEEPER_CLI" --config="$KEEPER_CONFIG" "get \"$RECORD_TITLE\"" 2>&1
+      "$KEEPER_CLI" --config="$KEEPER_CONFIG" "get \"$RECORD_TITLE\" --format=json" 2>&1
+    } | grep -oE '[A-Za-z0-9_-]{20,}' | sort -u
+  )"
+  [[ -n "$candidates" ]] || return 1
+
+  verified=""
+  while IFS= read -r uid; do
+    [[ -z "$uid" ]] && continue
+    out="$("$KEEPER_CLI" --config="$KEEPER_CONFIG" "get $uid --format=json" 2>&1)"
+    grep -qF "$RECORD_TITLE" <<<"$out" && verified="$verified
+$uid"
+  done <<<"$candidates"
+  verified="$(sort -u <<<"$verified" | grep -v '^$')"
+  [[ -n "$verified" ]] || return 1
+  echo "$verified"
+}
+
 # Filed flat in KEEPER_FOLDER, titled with the username (see README - no
-# per-user subfolder). Only the private key is uploaded.
+# per-user subfolder). The private key goes in twice: base64-encoded in a
+# custom field (for scripted retrieval), and as a real file attachment
+# named like a normal SSH key - so it can be downloaded as-is from the
+# Keeper UI, no decoding needed. The attachment is best-effort: the field
+# above is what resume-tracking relies on, so a failed attachment is logged
+# but doesn't fail the whole upload.
 keeper_upload_key() {
   log "uploading private key to Keeper as '$RECORD_TITLE'"
   local priv_b64 cmd out folder_arg=""
@@ -92,12 +127,29 @@ keeper_upload_key() {
   cmd="record-add --title \"$RECORD_TITLE\" --record-type login --force$folder_arg"
   cmd="$cmd \"login=$USER_NAME\" \"c.text.path=$USER_PATH\" \"c.secret.private_key_b64=$priv_b64\""
 
-  if out="$("$KEEPER_CLI" --config="$KEEPER_CONFIG" "$cmd" 2>&1)"; then
-    log "Keeper upload succeeded"
-    return 0
+  if ! out="$("$KEEPER_CLI" --config="$KEEPER_CONFIG" "$cmd" 2>&1)"; then
+    log "Keeper upload FAILED: $(tail -n 1 <<<"$out")"
+    return 1
   fi
-  log "Keeper upload FAILED: $(tail -n 1 <<<"$out")"
-  return 1
+
+  local attach_file="$WORK/id_${KEY_TYPE}"
+  cp "$KEY" "$attach_file"
+  if "$KEEPER_CLI" --config="$KEEPER_CONFIG" \
+      "upload-attachment --file \"$attach_file\" \"$RECORD_TITLE\"" >/dev/null 2>&1; then
+    log "attached a downloadable copy of the key"
+  else
+    local uid
+    uid="$(keeper_find_uid | head -1)"
+    if [[ -n "$uid" ]] && "$KEEPER_CLI" --config="$KEEPER_CONFIG" \
+        "upload-attachment --file \"$attach_file\" $uid" >/dev/null 2>&1; then
+      log "attached a downloadable copy of the key"
+    else
+      log "WARNING: could not attach a downloadable copy - the key is still in the private_key_b64 field"
+    fi
+  fi
+
+  log "Keeper upload succeeded"
+  return 0
 }
 
 # Keeper is the source of truth for "does this user already have a key" -
@@ -113,43 +165,14 @@ keeper_record_exists() {
   grep -qF "$RECORD_TITLE" <<<"$out"
 }
 
-# `ls -v` doesn't expose a UID on this Commander version (confirmed live -
-# it shows the same as plain `ls`), and `rm` needs one, same as `get` does.
-# So this collects UID-shaped candidates from several discovery methods,
-# read-verifies each one against the record before ever deleting anything,
-# and - if more than one verifies (can happen: some of these methods search
-# the whole vault, not just this folder) - deletes one at a time and
-# rechecks the folder until the record's actually gone, rather than
-# guessing which UID is the right one.
+# Deletes every verified UID (see keeper_find_uid above it) one at a time,
+# rechecking the folder after each - some discovery methods search the
+# whole vault, not just this one, so more than one can verify (e.g. a
+# same-titled leftover elsewhere). Never guesses which single UID is right.
 keeper_delete_record() {
   log "looking up the record's UID"
-  local candidates uid verified out
-
-  candidates="$(
-    {
-      "$KEEPER_CLI" --config="$KEEPER_CONFIG" "search \"$RECORD_TITLE\"" 2>&1
-      "$KEEPER_CLI" --config="$KEEPER_CONFIG" "list --format=json \"$RECORD_TITLE\"" 2>&1
-      "$KEEPER_CLI" --config="$KEEPER_CONFIG" "get \"$RECORD_TITLE\"" 2>&1
-      "$KEEPER_CLI" --config="$KEEPER_CONFIG" "get \"$RECORD_TITLE\" --format=json" 2>&1
-    } | grep -oE '[A-Za-z0-9_-]{20,}' | sort -u
-  )"
-  if [[ -z "$candidates" ]]; then
-    log "no UID candidates found for '$RECORD_TITLE'"
-    return 1
-  fi
-
-  verified=""
-  while IFS= read -r uid; do
-    [[ -z "$uid" ]] && continue
-    out="$("$KEEPER_CLI" --config="$KEEPER_CONFIG" "get $uid --format=json" 2>&1)"
-    grep -qF "$RECORD_TITLE" <<<"$out" && verified="$verified
-$uid"
-  done <<<"$candidates"
-  verified="$(sort -u <<<"$verified" | grep -v '^$')"
-  if [[ -z "$verified" ]]; then
-    log "no candidate UID verified against the record"
-    return 1
-  fi
+  local verified uid
+  verified="$(keeper_find_uid)" || { log "no UID found for '$RECORD_TITLE'"; return 1; }
 
   while IFS= read -r uid; do
     [[ -z "$uid" ]] && continue
